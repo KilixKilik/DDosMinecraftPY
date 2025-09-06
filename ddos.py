@@ -53,13 +53,17 @@ def send_pack(sock, pid, data):
     len_data = make_varint(len(pack))
     sock.sendall(len_data + pack)
 
-def move_bot(sock, x, y, z, grounded=1):
+def move_bot(sock, x, y, z, yaw=0.0, pitch=0.0, grounded=1, protocol=340):
     pos_data = bytearray()
     pos_data.extend(struct.pack('>d', x))
     pos_data.extend(struct.pack('>d', y))
     pos_data.extend(struct.pack('>d', z))
+    pos_data.extend(struct.pack('>f', yaw))
+    pos_data.extend(struct.pack('>f', pitch))
     pos_data.append(grounded)
-    send_pack(sock, 0x0C, pos_data)  # move pack
+    # В 1.16.5 пакет движения стал 0x2F, в 1.12.2 — 0x0C
+    pid = 0x2F if protocol >= 754 else 0x0C
+    send_pack(sock, pid, pos_data)  # move pack
 
 def connect_bot(host, port, bot_name, bid):
     tries = 0
@@ -82,9 +86,14 @@ def connect_bot(host, port, bot_name, bid):
             
     return None
 
-def bot_work(host, port, bot_name, msg, bid, move_gap=5):
+def bot_work(host, port, bot_name, msg, bid, move_gap=5, protocol=340):
     global go
-    pos = [-232.5 + random.uniform(-5, 5), 79.0, 239.5 + random.uniform(-5, 5)]
+    # Рандомизируем начальную позицию, включая Y
+    pos = [
+        -232.5 + random.uniform(-5, 5),
+        70.0 + random.uniform(0, 20),  # Y теперь тоже рандомный
+        239.5 + random.uniform(-5, 5)
+    ]
     
     while go:
         try:
@@ -94,11 +103,11 @@ def bot_work(host, port, bot_name, msg, bid, move_gap=5):
                 print(f"[Bot {bid}] Cant connect")
                 return
                 
-            print(f"[Bot {bid}] Connected")
+            print(f"[Bot {bid}] Connected (protocol {protocol})")
             
             # Handshake
             hs = bytearray()
-            hs.extend(make_varint(340))  # ver
+            hs.extend(make_varint(protocol))  # ver
             hs.extend(make_varint(len(host)))
             hs.extend(host.encode())
             hs.extend(struct.pack('>H', port))
@@ -120,7 +129,7 @@ def bot_work(host, port, bot_name, msg, bid, move_gap=5):
                     ln = get_varint(s)
                     pid = get_varint(s)
                     
-                    if pid == 0x02:  # login ok
+                    if pid == 0x02:  # login ok (1.12.2)
                         uuid_ln = get_varint(s)
                         s.recv(uuid_ln)  # skip uuid
                         name_ln = get_varint(s)
@@ -128,17 +137,54 @@ def bot_work(host, port, bot_name, msg, bid, move_gap=5):
                         print(f"[Bot {bid}] Logged in")
                         logged = 1
                         break
-                    elif pid == 0x1F:  # keepalive
+                    elif pid == 0x02 and protocol >= 754:  # login success 1.16.5
+                        # UUID (16 байт) + Username
+                        s.recv(16)  # skip UUID
+                        name_ln = get_varint(s)
+                        s.recv(name_ln)  # skip name
+                        print(f"[Bot {bid}] Logged in")
+                        logged = 1
+                        break
+                    elif pid == 0x01:  # encryption request (игнорируем для offline)
+                        # Пропускаем поля: сервер id, pubkey, verify token
+                        server_id_len = get_varint(s)
+                        s.recv(server_id_len)
+                        pubkey_len = get_varint(s)
+                        s.recv(pubkey_len)
+                        verify_token_len = get_varint(s)
+                        s.recv(verify_token_len)
+                        # Не отвечаем — сервер в offline режиме должен пропустить
+                        continue
+                    elif pid == 0x1F:  # keepalive 1.12.2
                         keep_id = get_varint(s)
                         resp = bytearray()
                         resp.extend(struct.pack('>Q', keep_id))
                         send_pack(s, 0x0B, resp)
+                    elif pid == 0x20 and protocol >= 754:  # keepalive 1.16.5
+                        keep_id = get_varint(s)
+                        resp = bytearray()
+                        resp.extend(struct.pack('>Q', keep_id))
+                        send_pack(s, 0x0F, resp)  # 0x0F в 1.16.5
+                    elif pid == 0x1A:  # disconnect 1.12.2
+                        reason_len = get_varint(s)
+                        reason = s.recv(reason_len)
+                        print(f"[Bot {bid}] Disconnected by server: {reason.decode('utf-8', errors='ignore')}")
+                        s.close()
+                        return
+                    elif pid == 0x19 and protocol >= 754:  # disconnect 1.16.5
+                        reason_len = get_varint(s)
+                        reason = s.recv(reason_len)
+                        print(f"[Bot {bid}] Disconnected by server: {reason.decode('utf-8', errors='ignore')}")
+                        s.close()
+                        return
                     else:
                         # Пропускаем лишнее
                         left = ln - 1
                         while left > 0:
-                            s.recv(min(1024, left))
-                            left -= 1024
+                            chunk = s.recv(min(1024, left))
+                            if not chunk:
+                                raise ConnectionError("conn dead")
+                            left -= len(chunk)
                 except (socket.timeout, TimeoutError):
                     continue
             
@@ -148,11 +194,26 @@ def bot_work(host, port, bot_name, msg, bid, move_gap=5):
                 time.sleep(5)
                 continue
                 
+            # После логина отправляем Client Settings (иначе сервер может не считать нас "загруженными")
+            settings_data = bytearray()
+            settings_data.extend(b'\x07')  # locale (например, "en_US")
+            settings_data.extend(b'\x01')  # view distance (10 chunks)
+            settings_data.extend(b'\x00')  # chat mode (enabled)
+            settings_data.extend(b'\x00')  # chat colors
+            settings_data.extend(b'\x7f')  # skin parts (all)
+            settings_data.extend(b'\x01')  # main hand (right)
+            # В 1.16.5 пакет стал 0x07, в 1.12.2 — 0x15
+            settings_pid = 0x07 if protocol >= 754 else 0x15
+            send_pack(s, settings_pid, settings_data)
+            print(f"[Bot {bid}] Sent client settings")
+            
             # Первое сообщение
             chat_data = bytearray()
             chat_data.extend(make_varint(len(msg)))
             chat_data.extend(msg.encode())
-            send_pack(s, 0x01, chat_data)
+            # В 1.16.5 чат стал 0x03, в 1.12.2 — 0x01
+            chat_pid = 0x03 if protocol >= 754 else 0x01
+            send_pack(s, chat_pid, chat_data)
             print(f"[Bot {bid}] First msg sent")
             
             # Основной цикл
@@ -167,7 +228,9 @@ def bot_work(host, port, bot_name, msg, bid, move_gap=5):
                 if now - last_keep > 20:
                     resp = bytearray()
                     resp.extend(struct.pack('>Q', 0))
-                    send_pack(s, 0x0B, resp)
+                    # В 1.16.5 — 0x0F, в 1.12.2 — 0x0B
+                    keep_pid = 0x0F if protocol >= 754 else 0x0B
+                    send_pack(s, keep_pid, resp)
                     last_keep = now
                 
                 # Отправка сообщений
@@ -175,7 +238,8 @@ def bot_work(host, port, bot_name, msg, bid, move_gap=5):
                     chat_data = bytearray()
                     chat_data.extend(make_varint(len(msg)))
                     chat_data.extend(msg.encode())
-                    send_pack(s, 0x01, chat_data)
+                    chat_pid = 0x03 if protocol >= 754 else 0x01
+                    send_pack(s, chat_pid, chat_data)
                     last_msg = now
                     print(f"[Bot {bid}] Msg sent")
                 
@@ -183,7 +247,11 @@ def bot_work(host, port, bot_name, msg, bid, move_gap=5):
                 if now - last_moved > move_gap:
                     pos[0] += random.uniform(-2, 2)
                     pos[2] += random.uniform(-2, 2)
-                    move_bot(s, pos[0], pos[1], pos[2])
+                    # Y тоже немного "плавает" для реализма
+                    pos[1] += random.uniform(-0.5, 0.5)
+                    # Ограничиваем Y, чтобы не улететь в космос или ад
+                    pos[1] = max(50.0, min(120.0, pos[1]))
+                    move_bot(s, pos[0], pos[1], pos[2], protocol=protocol)
                     last_moved = now
                 
                 # Чтение входящих
@@ -192,22 +260,50 @@ def bot_work(host, port, bot_name, msg, bid, move_gap=5):
                         ln = get_varint(s, timeout=2)
                         pid = get_varint(s)
                         
-                        if pid == 0x1F:  # keepalive
+                        if pid == 0x1F:  # keepalive 1.12.2
                             keep_id = get_varint(s)
                             resp = bytearray()
                             resp.extend(struct.pack('>Q', keep_id))
                             send_pack(s, 0x0B, resp)
                             last_keep = now
-                        elif pid == 0x0E:  # chat
+                        elif pid == 0x20 and protocol >= 754:  # keepalive 1.16.5
+                            keep_id = get_varint(s)
+                            resp = bytearray()
+                            resp.extend(struct.pack('>Q', keep_id))
+                            send_pack(s, 0x0F, resp)
+                            last_keep = now
+                        elif pid == 0x0E:  # chat 1.12.2
                             json_ln = get_varint(s)
                             s.recv(json_ln)
                             s.recv(1)  # position
+                        elif pid == 0x0F and protocol >= 754:  # chat 1.16.5
+                            # Может быть несколько форматов — пропускаем полностью
+                            left = ln - 1
+                            while left > 0:
+                                chunk = s.recv(min(1024, left))
+                                if not chunk:
+                                    raise ConnectionError("conn dead")
+                                left -= len(chunk)
+                        elif pid == 0x1A:  # disconnect 1.12.2
+                            reason_len = get_varint(s)
+                            reason = s.recv(reason_len)
+                            print(f"[Bot {bid}] Disconnected by server: {reason.decode('utf-8', errors='ignore')}")
+                            s.close()
+                            return
+                        elif pid == 0x19 and protocol >= 754:  # disconnect 1.16.5
+                            reason_len = get_varint(s)
+                            reason = s.recv(reason_len)
+                            print(f"[Bot {bid}] Disconnected by server: {reason.decode('utf-8', errors='ignore')}")
+                            s.close()
+                            return
                         else:
                             # Пропуск
                             left = ln - 1
                             while left > 0:
-                                s.recv(min(1024, left))
-                                left -= 1024
+                                chunk = s.recv(min(1024, left))
+                                if not chunk:
+                                    raise ConnectionError("conn dead")
+                                left -= len(chunk)
                 except (socket.timeout, TimeoutError):
                     continue
                 except Exception as e:
@@ -259,14 +355,23 @@ def main():
     msg_in = input("Spam msg: ").strip()
     move_gap_in = int(input("Move gap [5]: ") or 5)
     
-    # Сервер чек
+    # Определяем протокол по статусу сервера
+    protocol = 340  # по умолчанию 1.12.2
     try:
         srv = JavaServer(host_in, port_in)
         status = srv.status()
-        print(f"\nServer: {status.version.name}")
+        ver_str = status.version.name.lower()
+        print(f"\nServer version: {status.version.name}")
         print(f"Players: {status.players.online}/{status.players.max}")
+        
+        if "1.16" in ver_str or "1.17" in ver_str or "1.18" in ver_str or "1.19" in ver_str:
+            protocol = 754  # 1.16.5
+            print("→ Using protocol 754 (1.16.5)")
+        else:
+            print("→ Using protocol 340 (1.12.2)")
+            
     except Exception as e:
-        print(f"\nStatus check fail: {str(e)}")
+        print(f"\nStatus check fail: {str(e)}. Using default protocol 340.")
     
     # Старт ботов
     print("\nStarting bots... (Ctrl+C to stop)")
@@ -276,7 +381,7 @@ def main():
         bot_name = f"{bot_base}_{random.randint(1000, 9999)}"
         t = threading.Thread(
             target=bot_work, 
-            args=(host_in, port_in, bot_name, msg_in, i+1, move_gap_in),
+            args=(host_in, port_in, bot_name, msg_in, i+1, move_gap_in, protocol),
             daemon=1
         )
         t.start()
